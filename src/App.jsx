@@ -1,11 +1,14 @@
 import { useState, useRef, useEffect, useMemo } from "react";
+import JsBarcode from "jsbarcode";
+import { jsPDF } from "jspdf";
 
 // ============================================================
 // ORÇAMENTOS PATROTINTAS — v2
 // • Orçamento sempre aberto (tela única)
 // • Cliente padrão "Consumidor" (editável com um toque)
 // • Custo SEMPRE visível na tela — NUNCA no PDF
-// • "Enviar PDF" gera o PDF (imprimir → salvar) para anexar no WhatsApp
+// • "Enviar PDF" gera um arquivo .pdf de verdade (compartilhar/baixar)
+// • Código de barras de cada linha = "quantidade*sku" (ex: 5*7899389000175)
 // ============================================================
 
 const LARANJA = "#EE7203";
@@ -15,25 +18,80 @@ const CINZA_FUNDO = "#F5F3F0";
 
 // Produtos de exemplo — mesma estrutura do Excel (venda + custo)
 const PRODUTOS = [
-  { codigo: "000123", eans: ["7891234500011"], familia: "A", descricao: "FUTURA SUPER AMARELO 18L", preco: 300.0, custo: 198.5 },
-  { codigo: "000124", eans: ["7891234500028"], familia: "A", descricao: "MASSA PVA FUTURA GL", preco: 30.0, custo: 17.2 },
-  { codigo: "000125", eans: ["7891234500035"], familia: "A", descricao: "SUVINIL TOQUE DE SEDA BRANCO 18L", preco: 489.9, custo: 342.0 },
-  { codigo: "000201", eans: ["7891234500110"], familia: "DP 1", descricao: "FUTURA ACRILICO PREMIUM BRANCO 3,6L", preco: 89.9, custo: 58.4 },
-  { codigo: "000310", eans: ["7891234500219"], familia: "F 1", descricao: "MASSA CORRIDA CRISTAIS AMAIS 25KG", preco: 64.9, custo: 41.0 },
-  { codigo: "000412", eans: ["7891234500318"], familia: "D1", descricao: "ROLO DE LA 23CM ATLAS", preco: 24.9, custo: 14.3 },
-  { codigo: "000413", eans: ["7891234500325"], familia: "D1", descricao: "TRINCHA 2.1/2 TIGRE", preco: 12.9, custo: 6.8 },
-  { codigo: "000414", eans: ["7891234500332"], familia: "D1", descricao: "FITA CREPE 48MM X 50M 3M", preco: 18.5, custo: 10.9 },
-  { codigo: "000520", eans: ["7891234500417"], familia: "G", descricao: "SELADOR ACRILICO FARBEN 18L", preco: 149.9, custo: 96.0 },
+  { codigo: "000123", eans: ["7891234500011"], familia: "A", unidade: "UN", descricao: "FUTURA SUPER AMARELO 18L", preco: 300.0, custo: 198.5 },
+  { codigo: "000124", eans: ["7891234500028"], familia: "A", unidade: "UN", descricao: "MASSA PVA FUTURA GL", preco: 30.0, custo: 17.2 },
+  { codigo: "000125", eans: ["7891234500035"], familia: "A", unidade: "UN", descricao: "SUVINIL TOQUE DE SEDA BRANCO 18L", preco: 489.9, custo: 342.0 },
+  { codigo: "000201", eans: ["7891234500110"], familia: "DP 1", unidade: "UN", descricao: "FUTURA ACRILICO PREMIUM BRANCO 3,6L", preco: 89.9, custo: 58.4 },
+  { codigo: "000310", eans: ["7891234500219"], familia: "F 1", unidade: "UN", descricao: "MASSA CORRIDA CRISTAIS AMAIS 25KG", preco: 64.9, custo: 41.0 },
+  { codigo: "000412", eans: ["7891234500318"], familia: "D1", unidade: "PC", descricao: "ROLO DE LA 23CM ATLAS", preco: 24.9, custo: 14.3 },
+  { codigo: "000413", eans: ["7891234500325"], familia: "D1", unidade: "PC", descricao: "TRINCHA 2.1/2 TIGRE", preco: 12.9, custo: 6.8 },
+  { codigo: "000414", eans: ["7891234500332"], familia: "D1", unidade: "PC", descricao: "FITA CREPE 48MM X 50M 3M", preco: 18.5, custo: 10.9 },
+  { codigo: "000520", eans: ["7891234500417"], familia: "G", unidade: "UN", descricao: "SELADOR ACRILICO FARBEN 18L", preco: 149.9, custo: 96.0 },
 ];
 
 const fmt = (v) =>
   v.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 
+// Trava de acesso simples (senha única compartilhada) — guarda só o hash,
+// nunca a senha em texto puro. Válida para uso interno da loja; não é
+// segurança de nível bancário, já que o site é 100% estático (sem servidor).
+const SENHA_HASH = "9c9e12618b2377ed17319fd78d705cf7cbae5caca23af103dc664cdc263e5305";
+const CHAVE_AUTH = "patrotintas_auth";
+
+async function sha256Hex(texto) {
+  const buffer = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(texto));
+  return Array.from(new Uint8Array(buffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+// Gera a imagem (PNG) de um código de barras CODE128 fora da tela, para colar no PDF.
+// Valor codificado = "quantidade*sku" (ex: "5*7899389000175") — é assim que o
+// sistema de conferência/estoque lê a quantidade certa em uma única bipagem.
+function gerarBarcodeDataURL(valor) {
+  const canvas = document.createElement("canvas");
+  JsBarcode(canvas, valor, {
+    format: "CODE128",
+    width: 2,
+    height: 45,
+    fontSize: 13,
+    margin: 6,
+    displayValue: true,
+  });
+  return canvas.toDataURL("image/png");
+}
+
 export default function OrcamentoApp() {
+  const [autenticado, setAutenticado] = useState(() => localStorage.getItem(CHAVE_AUTH) === "1");
+  const [senhaInput, setSenhaInput] = useState("");
+  const [erroSenha, setErroSenha] = useState(false);
+  const [verificando, setVerificando] = useState(false);
+
+  const entrar = async (e) => {
+    e.preventDefault();
+    setVerificando(true);
+    const hash = await sha256Hex(senhaInput);
+    setVerificando(false);
+    if (hash === SENHA_HASH) {
+      localStorage.setItem(CHAVE_AUTH, "1");
+      setAutenticado(true);
+      setErroSenha(false);
+      setSenhaInput("");
+    } else {
+      setErroSenha(true);
+    }
+  };
+
+  const sair = () => {
+    localStorage.removeItem(CHAVE_AUTH);
+    setAutenticado(false);
+  };
+
   const [busca, setBusca] = useState("");
   const [itens, setItens] = useState([]); // {produto, qtd, preco}
   const [cliente, setCliente] = useState("Consumidor");
   const [observacao, setObservacao] = useState("");
+  const [desconto, setDesconto] = useState(0);
   const [aviso, setAviso] = useState(null);
   const [cameraAberta, setCameraAberta] = useState(false);
   const buscaRef = useRef(null);
@@ -100,14 +158,13 @@ export default function OrcamentoApp() {
   }, [cameraAberta]);
 
   const resultados = useMemo(() => {
-    const t = busca.trim().toUpperCase();
-    if (!t) return [];
-    return PRODUTOS.filter(
-      (p) =>
-        p.descricao.includes(t) ||
-        p.codigo.includes(t) ||
-        p.eans.some((e) => e.includes(t))
-    ).slice(0, 8);
+    // Busca por palavras soltas, em qualquer ordem: "futura 18" acha "FUTURA SUPER AMARELO 18L"
+    const termos = busca.trim().toUpperCase().split(/\s+/).filter(Boolean);
+    if (termos.length === 0) return [];
+    return PRODUTOS.filter((p) => {
+      const alvo = `${p.descricao} ${p.codigo} ${p.eans.join(" ")}`.toUpperCase();
+      return termos.every((t) => alvo.includes(t));
+    }).slice(0, 8);
   }, [busca]);
 
   const mostrarAviso = (msg, tipo = "erro") => {
@@ -165,7 +222,8 @@ export default function OrcamentoApp() {
   const remover = (codigo) =>
     setItens((prev) => prev.filter((i) => i.produto.codigo !== codigo));
 
-  const total = itens.reduce((s, i) => s + i.qtd * i.preco, 0);
+  const subtotal = itens.reduce((s, i) => s + i.qtd * i.preco, 0);
+  const total = Math.max(0, subtotal - (Number(desconto) || 0));
   const custoTotal = itens.reduce((s, i) => s + i.qtd * i.produto.custo, 0);
   const numOrc = useMemo(
     () =>
@@ -175,33 +233,200 @@ export default function OrcamentoApp() {
       String(Math.floor(Math.random() * 900) + 100),
     []
   );
-  const hoje = new Date().toLocaleDateString("pt-BR");
+  const agora = new Date();
+  const hoje = agora.toLocaleDateString("pt-BR");
+  const hora = agora.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
 
-  // Enviar PDF: imprime SÓ o documento (custo fica de fora)
-  const enviarPDF = () => {
-    if (itens.filter((i) => i.qtd > 0).length === 0) {
+  const itensValidos = itens.filter((i) => i.qtd > 0);
+
+  // Gera o PDF de verdade (arquivo, não impressão) e tenta abrir o compartilhamento
+  // do celular (pra já anexar no WhatsApp); se não der, baixa o arquivo.
+  const enviarPDF = async () => {
+    if (itensValidos.length === 0) {
       mostrarAviso("Adicione itens antes de gerar o PDF");
       return;
     }
-    window.print();
+
+    const doc = new jsPDF({ unit: "mm", format: "a4" });
+    const pageWidth = 210;
+    const marginX = 12;
+    const rightX = pageWidth - marginX;
+    const colQtd = 60;
+    const colUnid = 78;
+    const colDesc = 90;
+    const colValor = 165;
+    let pagina = 1;
+    let y = 16;
+
+    const linha = (yy) => {
+      doc.setDrawColor(0);
+      doc.setLineWidth(0.3);
+      doc.line(marginX, yy, rightX, yy);
+    };
+
+    const cabecalho = () => {
+      doc.setFillColor(238, 114, 3);
+      doc.roundedRect(marginX, y - 5, 38, 9, 1.5, 1.5, "F");
+      doc.setTextColor(255, 255, 255);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(12);
+      doc.text("PatroTintas", marginX + 19, y, { align: "center" });
+
+      doc.setTextColor(0, 0, 0);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(9);
+      doc.text(
+        ["NÃO É DOCUMENTO FISCAL - NÃO É VALIDO COMO RECIBO E COMO", "GARANTIA DE MERCADORIA - NÃO COMPROVA PAGAMENTO"],
+        pageWidth / 2,
+        y - 4,
+        { align: "center" }
+      );
+      doc.setFont("helvetica", "normal");
+      doc.text(`Pág: ${pagina}`, rightX, y - 4, { align: "right" });
+
+      y += 8;
+      linha(y);
+      y += 5;
+
+      doc.setFontSize(10);
+      doc.text(`Cliente: 000000 - ${cliente.toUpperCase()}`, marginX, y);
+      doc.text(`${hoje} ${hora}`, rightX, y, { align: "right" });
+      y += 3;
+      linha(y);
+      y += 6;
+
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(9);
+      doc.text("Produto", marginX, y);
+      doc.text("Qtd.", colQtd, y, { align: "center" });
+      doc.text("Unid", colUnid, y, { align: "center" });
+      doc.text("Descrição", colDesc, y);
+      doc.text("Valor", colValor, y, { align: "right" });
+      doc.text("Subtotal", rightX, y, { align: "right" });
+      y += 2;
+      linha(y);
+      y += 6;
+      doc.setFont("helvetica", "normal");
+    };
+
+    cabecalho();
+
+    for (const item of itensValidos) {
+      const qtdInt = Math.max(1, Math.round(item.qtd));
+      const sku = item.produto.eans[0] || item.produto.codigo;
+      const descLinhas = doc.splitTextToSize(item.produto.descricao, 68);
+
+      const alturaTexto = descLinhas.length * 4 + (item.obs ? 4 : 0);
+      const alturaLinha = Math.max(alturaTexto, 5) + 22;
+      if (y + alturaLinha > 278) {
+        doc.addPage();
+        pagina += 1;
+        y = 16;
+        cabecalho();
+      }
+
+      doc.setFontSize(9);
+      doc.setTextColor(0, 0, 0);
+      doc.text(item.produto.familia || "-", marginX, y);
+      doc.text(item.qtd.toFixed(2).replace(".", ","), colQtd, y, { align: "center" });
+      doc.text(item.produto.unidade || "-", colUnid, y, { align: "center" });
+      doc.text(descLinhas, colDesc, y);
+      doc.text(item.preco.toFixed(2), colValor, y, { align: "right" });
+      doc.text((item.qtd * item.preco).toFixed(2), rightX, y, { align: "right" });
+
+      let yLinha = y + descLinhas.length * 4;
+      if (item.obs) {
+        doc.setFontSize(7.5);
+        doc.setTextColor(110, 110, 110);
+        doc.text(`Obs: ${item.obs}`, colDesc, yLinha);
+        doc.setTextColor(0, 0, 0);
+        yLinha += 4;
+      }
+
+      yLinha += 3;
+      const barcodeUrl = gerarBarcodeDataURL(`${qtdInt}*${sku}`);
+      doc.addImage(barcodeUrl, "PNG", marginX, yLinha, 55, 14);
+      yLinha += 17;
+      linha(yLinha);
+      y = yLinha + 5;
+    }
+
+    y += 3;
+    doc.setFontSize(10);
+    doc.text("Subtotal", colValor, y, { align: "right" });
+    doc.text(subtotal.toFixed(2), rightX, y, { align: "right" });
+    y += 5;
+    doc.text("Desconto", colValor, y, { align: "right" });
+    doc.text((Number(desconto) || 0).toFixed(2), rightX, y, { align: "right" });
+    y += 7;
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(13);
+    doc.text("Total", colValor, y, { align: "right" });
+    doc.text(total.toFixed(2), rightX, y, { align: "right" });
+
+    if (observacao) {
+      y += 10;
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.text(`Observação: ${observacao}`, marginX, y, { maxWidth: rightX - marginX });
+    }
+
+    const nomeArquivo = `${numOrc}.pdf`;
+    const blob = doc.output("blob");
+    try {
+      const arquivo = new File([blob], nomeArquivo, { type: "application/pdf" });
+      if (navigator.canShare && navigator.canShare({ files: [arquivo] })) {
+        await navigator.share({ files: [arquivo], title: nomeArquivo });
+        return;
+      }
+    } catch {
+      // usuário cancelou o compartilhamento, ou não é suportado — cai no download
+    }
+    doc.save(nomeArquivo);
   };
 
-  const itensValidos = itens.filter((i) => i.qtd > 0);
+  if (!autenticado) {
+    return (
+      <div style={{ minHeight: "100vh", background: CINZA_FUNDO, fontFamily: "system-ui, sans-serif", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+        <form
+          onSubmit={entrar}
+          style={{ background: "white", borderRadius: 14, padding: "32px 28px", width: "100%", maxWidth: 320, boxShadow: "0 4px 20px rgba(0,0,0,.12)", textAlign: "center", boxSizing: "border-box" }}
+        >
+          <div style={{ fontWeight: 800, fontSize: 24, marginBottom: 2 }}>
+            Patro<span style={{ color: LARANJA }}>Tintas</span>
+          </div>
+          <div style={{ fontSize: 13, color: "#888", marginBottom: 22 }}>Orçamentos</div>
+          <input
+            type="password"
+            autoFocus
+            value={senhaInput}
+            onChange={(e) => {
+              setSenhaInput(e.target.value);
+              setErroSenha(false);
+            }}
+            placeholder="Senha"
+            style={{ width: "100%", padding: "12px 14px", fontSize: 16, border: `2px solid ${erroSenha ? "#C62828" : "#ddd"}`, borderRadius: 8, boxSizing: "border-box", textAlign: "center" }}
+          />
+          {erroSenha && <div style={{ color: "#C62828", fontSize: 13, marginTop: 8 }}>Senha incorreta</div>}
+          <button
+            type="submit"
+            disabled={verificando}
+            style={{ marginTop: 16, width: "100%", background: LARANJA, color: "white", border: "none", borderRadius: 8, padding: "12px", fontWeight: 800, fontSize: 15, cursor: "pointer" }}
+          >
+            {verificando ? "Verificando…" : "Entrar"}
+          </button>
+        </form>
+      </div>
+    );
+  }
 
   return (
     <div style={{ minHeight: "100vh", background: CINZA_FUNDO, fontFamily: "system-ui, sans-serif", paddingBottom: 90 }}>
       <style>{`
-        @media print {
-          .so-tela { display: none !important; }
-          .so-pdf { display: block !important; }
-          body { background: white !important; }
-        }
-        .so-pdf { display: none; }
         input:focus { outline-color: ${LARANJA}; }
       `}</style>
 
-      {/* ================= TELA (não sai no PDF) ================= */}
-      <div className="so-tela">
+      <div>
         {/* Topo fixo: marca + busca */}
         <div style={{ position: "sticky", top: 0, zIndex: 20, background: LARANJA, padding: "10px 14px 12px", boxShadow: "0 2px 8px rgba(0,0,0,.2)" }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
@@ -209,14 +434,23 @@ export default function OrcamentoApp() {
               Patro<span style={{ color: AMARELO }}>Tintas</span>
               <span style={{ fontWeight: 500, fontSize: 12, marginLeft: 8, opacity: 0.9 }}>Orçamento {numOrc.slice(-3)}</span>
             </div>
-            {/* Cliente padrão Consumidor — clica e edita */}
-            <input
-              value={cliente}
-              onChange={(e) => setCliente(e.target.value)}
-              onFocus={(e) => e.target.select()}
-              style={{ background: "rgba(255,255,255,.92)", border: "none", borderRadius: 6, padding: "6px 10px", fontSize: 13, fontWeight: 700, color: LARANJA_ESCURO, width: 130, textAlign: "right" }}
-              title="Cliente (toque para modificar)"
-            />
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              {/* Cliente padrão Consumidor — clica e edita */}
+              <input
+                value={cliente}
+                onChange={(e) => setCliente(e.target.value)}
+                onFocus={(e) => e.target.select()}
+                style={{ background: "rgba(255,255,255,.92)", border: "none", borderRadius: 6, padding: "6px 10px", fontSize: 13, fontWeight: 700, color: LARANJA_ESCURO, width: 130, textAlign: "right" }}
+                title="Cliente (toque para modificar)"
+              />
+              <button
+                onClick={sair}
+                title="Sair"
+                style={{ background: "rgba(255,255,255,.15)", border: "none", borderRadius: 6, padding: "6px 8px", fontSize: 14, cursor: "pointer" }}
+              >
+                🔒
+              </button>
+            </div>
           </div>
           <div style={{ display: "flex", gap: 8 }}>
             <input
@@ -343,6 +577,20 @@ export default function OrcamentoApp() {
             rows={2}
             style={{ marginTop: 10, padding: "10px 12px", fontSize: 14, border: "1.5px solid #ddd", borderRadius: 8, boxSizing: "border-box", width: "100%", background: "white", fontFamily: "inherit", resize: "vertical" }}
           />
+
+          {/* Desconto — aparece no PDF */}
+          <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 8, justifyContent: "flex-end" }}>
+            <span style={{ fontSize: 13, color: "#666" }}>Desconto R$</span>
+            <input
+              type="number"
+              inputMode="decimal"
+              step="0.01"
+              min={0}
+              value={desconto}
+              onChange={(e) => setDesconto(Math.max(0, Number(e.target.value) || 0))}
+              style={{ width: 90, padding: "6px 8px", fontSize: 14, border: "1.5px solid #ddd", borderRadius: 6, fontWeight: 600, textAlign: "right" }}
+            />
+          </div>
         </div>
 
         {/* Rodapé fixo: total + enviar PDF */}
@@ -351,78 +599,13 @@ export default function OrcamentoApp() {
             <div style={{ fontSize: 11, color: "#888" }}>Total do orçamento</div>
             <div style={{ fontSize: 20, fontWeight: 800, color: LARANJA_ESCURO }}>{fmt(total)}</div>
             <div style={{ fontSize: 12, color: "#999" }}>
+              {desconto > 0 && <>Subtotal {fmt(subtotal)} · Desconto {fmt(desconto)} · </>}
               Custo total {fmt(custoTotal)}
             </div>
           </div>
           <button onClick={enviarPDF} style={{ background: "#25D366", color: "white", border: "none", borderRadius: 10, padding: "13px 20px", fontWeight: 800, fontSize: 15, cursor: "pointer" }}>
             📄 Enviar PDF
           </button>
-        </div>
-      </div>
-
-      {/* ================= PDF (só aparece na impressão) ================= */}
-      <div className="so-pdf">
-        <div style={{ maxWidth: 720, margin: "0 auto", background: "white" }}>
-          <div style={{ background: LARANJA, color: "white", padding: "20px 28px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <div>
-              <div style={{ fontSize: 26, fontWeight: 800 }}>
-                Patro<span style={{ color: AMARELO }}>Tintas</span>
-              </div>
-              <div style={{ fontSize: 12 }}>WhatsApp (34) 3099-2828</div>
-            </div>
-            <div style={{ textAlign: "right", fontSize: 13 }}>
-              <div style={{ fontWeight: 700 }}>ORÇAMENTO {numOrc}</div>
-              <div>Data: {hoje}</div>
-            </div>
-          </div>
-
-          <div style={{ padding: "12px 28px", borderBottom: `3px solid ${AMARELO}`, fontSize: 14 }}>
-            <b>Cliente:</b> {cliente}
-          </div>
-
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-            <thead>
-              <tr style={{ background: "#FFF3E6", color: LARANJA_ESCURO }}>
-                <th style={{ padding: "8px 10px", textAlign: "center" }}>Qtd</th>
-                <th style={{ padding: "8px 10px", textAlign: "left" }}>Descrição</th>
-                <th style={{ padding: "8px 10px", textAlign: "right" }}>Unit.</th>
-                <th style={{ padding: "8px 10px", textAlign: "right" }}>Total</th>
-              </tr>
-            </thead>
-            <tbody>
-              {itensValidos.map((i) => (
-                <tr key={i.produto.codigo} style={{ borderBottom: "1px solid #eee" }}>
-                  <td style={{ padding: "8px 10px", textAlign: "center" }}>{i.qtd}</td>
-                  <td style={{ padding: "8px 10px" }}>
-                    {i.produto.descricao}
-                    {i.obs && (
-                      <div style={{ fontSize: 11, color: "#777", fontStyle: "italic" }}>
-                        Obs: {i.obs}
-                      </div>
-                    )}
-                  </td>
-                  <td style={{ padding: "8px 10px", textAlign: "right" }}>{fmt(i.preco)}</td>
-                  <td style={{ padding: "8px 10px", textAlign: "right", fontWeight: 600 }}>{fmt(i.qtd * i.preco)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-
-          <div style={{ padding: "14px 28px", display: "flex", justifyContent: "flex-end" }}>
-            <div style={{ background: LARANJA, color: "white", padding: "8px 18px", fontWeight: 800, fontSize: 16, borderRadius: 4 }}>
-              TOTAL {fmt(total)}
-            </div>
-          </div>
-
-          {observacao && (
-            <div style={{ margin: "0 28px 14px", padding: "10px 14px", background: "#FFF8EC", borderLeft: `4px solid ${AMARELO}`, fontSize: 13 }}>
-              <b>Observação:</b> {observacao}
-            </div>
-          )}
-
-          <div style={{ padding: "0 28px 20px", fontSize: 11, color: "#999" }}>
-            Orçamento válido por 7 dias. Este documento não é fiscal.
-          </div>
         </div>
       </div>
     </div>
