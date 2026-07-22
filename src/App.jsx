@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect, useMemo } from "react";
 import JsBarcode from "jsbarcode";
 import { jsPDF } from "jspdf";
+import { doc, getDoc, setDoc, serverTimestamp } from "firebase/firestore";
+import { db, firebaseConfigurado } from "./firebase.js";
 
 // ============================================================
 // ORÇAMENTOS PATROTINTAS — v2
@@ -16,8 +18,8 @@ const LARANJA_ESCURO = "#C85E00";
 const AMARELO = "#FFC20E";
 const CINZA_FUNDO = "#F5F3F0";
 
-// Produtos de exemplo — mesma estrutura do Excel (venda + custo)
-const PRODUTOS = [
+// Produtos de exemplo — usados só até a loja importar o arquivo real de preços
+const PRODUTOS_PADRAO = [
   { codigo: "000123", eans: ["7891234500011"], familia: "A", unidade: "UN", descricao: "FUTURA SUPER AMARELO 18L", preco: 300.0, custo: 198.5 },
   { codigo: "000124", eans: ["7891234500028"], familia: "A", unidade: "UN", descricao: "MASSA PVA FUTURA GL", preco: 30.0, custo: 17.2 },
   { codigo: "000125", eans: ["7891234500035"], familia: "A", unidade: "UN", descricao: "SUVINIL TOQUE DE SEDA BRANCO 18L", preco: 489.9, custo: 342.0 },
@@ -28,6 +30,74 @@ const PRODUTOS = [
   { codigo: "000414", eans: ["7891234500332"], familia: "D1", unidade: "PC", descricao: "FITA CREPE 48MM X 50M 3M", preco: 18.5, custo: 10.9 },
   { codigo: "000520", eans: ["7891234500417"], familia: "G", unidade: "UN", descricao: "SELADOR ACRILICO FARBEN 18L", preco: 149.9, custo: 96.0 },
 ];
+
+const CHAVE_PRODUTOS = "patrotintas_produtos";
+
+const normalizarTexto = (s) =>
+  String(s ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+
+// Lê o arquivo (.xls / .xlsx / .csv) escolhido pela loja e converte pro formato
+// do app. Colunas esperadas: Codigo, Barras, Família, Descrição do produto, Custo, Preço Venda.
+async function lerArquivoProdutos(file) {
+  const XLSX = await import("xlsx");
+  const buffer = await file.arrayBuffer();
+  const planilha = XLSX.read(buffer, { type: "array" });
+  const aba = planilha.Sheets[planilha.SheetNames[0]];
+  const linhas = XLSX.utils.sheet_to_json(aba, { defval: "" });
+
+  return linhas
+    .map((linha) => {
+      const campos = {};
+      Object.keys(linha).forEach((chave) => {
+        campos[normalizarTexto(chave)] = linha[chave];
+      });
+      const codigo = String(campos["codigo"] ?? "").trim();
+      const barras = String(campos["barras"] ?? "").trim();
+      const descricao = String(campos["descricao do produto"] ?? campos["descricao"] ?? "").trim();
+      if (!codigo || !descricao) return null;
+      return {
+        codigo,
+        eans: barras ? [barras] : [],
+        familia: String(campos["familia"] ?? "").trim(),
+        unidade: String(campos["unidade"] ?? "UN").trim() || "UN",
+        descricao,
+        preco: Number(campos["preco venda"] ?? campos["preco"]) || 0,
+        custo: Number(campos["custo"]) || 0,
+      };
+    })
+    .filter(Boolean);
+}
+
+// Sincronização em nuvem (Firestore) — todo aparelho lê daqui, então quando a
+// loja importa um arquivo novo, todo mundo passa a ver a lista atualizada
+// (na próxima vez que abrir/recarregar o site).
+const DOC_PRODUTOS = () => doc(db, "patrotintas", "produtos");
+
+async function carregarProdutosNuvem() {
+  if (!firebaseConfigurado) return null;
+  try {
+    const snap = await getDoc(DOC_PRODUTOS());
+    if (!snap.exists()) return null;
+    const json = snap.data().json;
+    return json ? JSON.parse(json) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function salvarProdutosNuvem(produtos) {
+  if (!firebaseConfigurado) return false;
+  try {
+    await setDoc(DOC_PRODUTOS(), { json: JSON.stringify(produtos), atualizadoEm: serverTimestamp() });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const fmt = (v) =>
   v.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
@@ -87,6 +157,62 @@ export default function OrcamentoApp() {
     setAutenticado(false);
   };
 
+  const [produtos, setProdutos] = useState(() => {
+    try {
+      const salvos = localStorage.getItem(CHAVE_PRODUTOS);
+      return salvos ? JSON.parse(salvos) : PRODUTOS_PADRAO;
+    } catch {
+      return PRODUTOS_PADRAO;
+    }
+  });
+  const [painelProdutosAberto, setPainelProdutosAberto] = useState(false);
+  const [importando, setImportando] = useState(false);
+  const arquivoRef = useRef(null);
+
+  // Ao abrir o app, busca a lista mais recente da nuvem (o que outro vendedor
+  // importou fica valendo pra todo mundo). Se não der (sem internet, Firebase
+  // ainda não configurado…), continua usando a cópia salva neste aparelho.
+  useEffect(() => {
+    carregarProdutosNuvem().then((produtosNuvem) => {
+      if (produtosNuvem && produtosNuvem.length > 0) {
+        setProdutos(produtosNuvem);
+        localStorage.setItem(CHAVE_PRODUTOS, JSON.stringify(produtosNuvem));
+      }
+    });
+  }, []);
+
+  const importarArquivo = async (file) => {
+    setImportando(true);
+    try {
+      const novosProdutos = await lerArquivoProdutos(file);
+      if (novosProdutos.length === 0) {
+        mostrarAviso("Não encontrei produtos válidos nesse arquivo");
+        return;
+      }
+      setProdutos(novosProdutos);
+      localStorage.setItem(CHAVE_PRODUTOS, JSON.stringify(novosProdutos));
+      const sincronizou = await salvarProdutosNuvem(novosProdutos);
+      mostrarAviso(
+        sincronizou
+          ? `${novosProdutos.length} produtos importados e sincronizados para todos`
+          : `${novosProdutos.length} produtos importados (só neste aparelho — nuvem indisponível)`,
+        "ok"
+      );
+      setPainelProdutosAberto(false);
+    } catch {
+      mostrarAviso("Não consegui ler esse arquivo");
+    } finally {
+      setImportando(false);
+    }
+  };
+
+  const excluirProdutos = async () => {
+    setProdutos([]);
+    localStorage.removeItem(CHAVE_PRODUTOS);
+    await salvarProdutosNuvem([]);
+    mostrarAviso("Lista de produtos apagada para todos", "ok");
+  };
+
   const [busca, setBusca] = useState("");
   const [itens, setItens] = useState([]); // {produto, qtd, preco}
   const [cliente, setCliente] = useState("Consumidor");
@@ -131,8 +257,8 @@ export default function OrcamentoApp() {
             if (codigos.length > 0) {
               const valor = codigos[0].rawValue;
               const alvo =
-                PRODUTOS.find((p) => p.eans.includes(valor)) ||
-                PRODUTOS.find((p) => p.codigo === valor);
+                produtos.find((p) => p.eans.includes(valor)) ||
+                produtos.find((p) => p.codigo === valor);
               if (alvo) {
                 adicionar(alvo);
                 setCameraAberta(false);
@@ -155,17 +281,17 @@ export default function OrcamentoApp() {
       clearTimeout(timer);
       stream?.getTracks().forEach((t) => t.stop());
     };
-  }, [cameraAberta]);
+  }, [cameraAberta, produtos]);
 
   const resultados = useMemo(() => {
     // Busca por palavras soltas, em qualquer ordem: "futura 18" acha "FUTURA SUPER AMARELO 18L"
     const termos = busca.trim().toUpperCase().split(/\s+/).filter(Boolean);
     if (termos.length === 0) return [];
-    return PRODUTOS.filter((p) => {
+    return produtos.filter((p) => {
       const alvo = `${p.descricao} ${p.codigo} ${p.eans.join(" ")}`.toUpperCase();
       return termos.every((t) => alvo.includes(t));
     }).slice(0, 8);
-  }, [busca]);
+  }, [busca, produtos]);
 
   const mostrarAviso = (msg, tipo = "erro") => {
     setAviso({ msg, tipo });
@@ -193,8 +319,8 @@ export default function OrcamentoApp() {
     const t = busca.trim();
     if (!t) return;
     const alvo =
-      PRODUTOS.find((p) => p.eans.includes(t)) ||
-      PRODUTOS.find((p) => p.codigo === t);
+      produtos.find((p) => p.eans.includes(t)) ||
+      produtos.find((p) => p.codigo === t);
     if (alvo) adicionar(alvo);
     else if (resultados.length === 1) adicionar(resultados[0]);
     else if (resultados.length === 0) {
@@ -444,6 +570,13 @@ export default function OrcamentoApp() {
                 title="Cliente (toque para modificar)"
               />
               <button
+                onClick={() => setPainelProdutosAberto(true)}
+                title="Gerenciar produtos"
+                style={{ background: "rgba(255,255,255,.15)", border: "none", borderRadius: 6, padding: "6px 8px", fontSize: 14, cursor: "pointer" }}
+              >
+                📦
+              </button>
+              <button
                 onClick={sair}
                 title="Sair"
                 style={{ background: "rgba(255,255,255,.15)", border: "none", borderRadius: 6, padding: "6px 8px", fontSize: 14, cursor: "pointer" }}
@@ -501,6 +634,54 @@ export default function OrcamentoApp() {
             >
               Fechar
             </button>
+          </div>
+        )}
+
+        {painelProdutosAberto && (
+          <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.6)", zIndex: 60, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+            <div style={{ background: "white", borderRadius: 14, padding: 24, width: "100%", maxWidth: 380, boxSizing: "border-box" }}>
+              <div style={{ fontWeight: 800, fontSize: 17, marginBottom: 4 }}>Produtos cadastrados</div>
+              <div style={{ fontSize: 13, color: "#888", marginBottom: 18 }}>
+                {produtos.length} produto{produtos.length === 1 ? "" : "s"} na lista atual (salva neste aparelho)
+              </div>
+
+              <input
+                ref={arquivoRef}
+                type="file"
+                accept=".xls,.xlsx,.csv"
+                style={{ display: "none" }}
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) importarArquivo(f);
+                  e.target.value = "";
+                }}
+              />
+              <button
+                onClick={() => arquivoRef.current?.click()}
+                disabled={importando}
+                style={{ width: "100%", background: LARANJA, color: "white", border: "none", borderRadius: 8, padding: "12px", fontWeight: 800, fontSize: 14, cursor: "pointer", marginBottom: 8 }}
+              >
+                {importando ? "Importando…" : "📎 Escolher arquivo (.xls, .xlsx, .csv)"}
+              </button>
+              <div style={{ fontSize: 11, color: "#999", marginBottom: 16 }}>
+                Colunas esperadas: Codigo, Barras, Família, Descrição do produto, Custo, Preço Venda.
+                Importar um arquivo <b>substitui</b> a lista atual.
+              </div>
+
+              <button
+                onClick={excluirProdutos}
+                style={{ width: "100%", background: "none", border: "1.5px solid #C62828", color: "#C62828", borderRadius: 8, padding: "10px", fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 8 }}
+              >
+                Excluir todos os produtos
+              </button>
+
+              <button
+                onClick={() => setPainelProdutosAberto(false)}
+                style={{ width: "100%", background: "#eee", border: "none", borderRadius: 8, padding: "10px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}
+              >
+                Fechar
+              </button>
+            </div>
           </div>
         )}
 
