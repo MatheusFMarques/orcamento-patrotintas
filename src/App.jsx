@@ -99,8 +99,16 @@ async function salvarProdutosNuvem(produtos) {
   }
 }
 
+// Converte para número aceitando vírgula (pt-BR) ou ponto, e texto vazio.
+// Ex.: "52,36" -> 52.36, "" -> 0, 300 -> 300
+const num = (v) => {
+  if (typeof v === "number") return v;
+  const n = parseFloat(String(v ?? "").replace(",", "."));
+  return isNaN(n) ? 0 : n;
+};
+
 const fmt = (v) =>
-  v.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+  num(v).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 
 // Trava de acesso simples (senha única compartilhada) — guarda só o hash,
 // nunca a senha em texto puro. Válida para uso interno da loja; não é
@@ -217,7 +225,7 @@ export default function OrcamentoApp() {
   const [itens, setItens] = useState([]); // {produto, qtd, preco}
   const [cliente, setCliente] = useState("Consumidor");
   const [observacao, setObservacao] = useState("");
-  const [desconto, setDesconto] = useState(0);
+  const [desconto, setDesconto] = useState("");
   const [aviso, setAviso] = useState(null);
   const [cameraAberta, setCameraAberta] = useState(false);
   const buscaRef = useRef(null);
@@ -303,7 +311,7 @@ export default function OrcamentoApp() {
       const ix = prev.findIndex((i) => i.produto.codigo === produto.codigo);
       if (ix >= 0) {
         const novo = [...prev];
-        novo[ix] = { ...novo[ix], qtd: novo[ix].qtd + 1 };
+        novo[ix] = { ...novo[ix], qtd: num(novo[ix].qtd) + 1 };
         setTimeout(() => qtdRefs.current[produto.codigo]?.select(), 50);
         return novo;
       }
@@ -329,14 +337,16 @@ export default function OrcamentoApp() {
     }
   };
 
-  const alterar = (codigo, campo, valor) =>
+  // Guarda o texto exatamente como digitado (aceitando vírgula e campo vazio);
+  // a conversão para número acontece só na hora de calcular, via num().
+  const alterar = (codigo, campo, valor) => {
+    const limpo = String(valor).replace(/[^\d.,]/g, "");
     setItens((prev) =>
       prev.map((i) =>
-        i.produto.codigo === codigo
-          ? { ...i, [campo]: Math.max(0, Number(valor) || 0) }
-          : i
+        i.produto.codigo === codigo ? { ...i, [campo]: limpo } : i
       )
     );
+  };
 
   const alterarObs = (codigo, valor) =>
     setItens((prev) =>
@@ -348,9 +358,9 @@ export default function OrcamentoApp() {
   const remover = (codigo) =>
     setItens((prev) => prev.filter((i) => i.produto.codigo !== codigo));
 
-  const subtotal = itens.reduce((s, i) => s + i.qtd * i.preco, 0);
-  const total = Math.max(0, subtotal - (Number(desconto) || 0));
-  const custoTotal = itens.reduce((s, i) => s + i.qtd * i.produto.custo, 0);
+  const subtotal = itens.reduce((s, i) => s + num(i.qtd) * num(i.preco), 0);
+  const total = Math.max(0, subtotal - num(desconto));
+  const custoTotal = itens.reduce((s, i) => s + num(i.qtd) * i.produto.custo, 0);
   const numOrc = useMemo(
     () =>
       "ORC-" +
@@ -363,7 +373,7 @@ export default function OrcamentoApp() {
   const hoje = agora.toLocaleDateString("pt-BR");
   const hora = agora.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
 
-  const itensValidos = itens.filter((i) => i.qtd > 0);
+  const itensValidos = itens.filter((i) => num(i.qtd) > 0);
 
   // Gera o PDF de verdade (arquivo, não impressão) e tenta abrir o compartilhamento
   // do celular (pra já anexar no WhatsApp); se não der, baixa o arquivo.
@@ -438,7 +448,7 @@ export default function OrcamentoApp() {
     cabecalho();
 
     for (const item of itensValidos) {
-      const qtdInt = Math.max(1, Math.round(item.qtd));
+      const qtdInt = Math.max(1, Math.round(num(item.qtd)));
       const sku = item.produto.eans[0] || item.produto.codigo;
       const descLinhas = doc.splitTextToSize(item.produto.descricao, 68);
 
@@ -454,11 +464,11 @@ export default function OrcamentoApp() {
       doc.setFontSize(9);
       doc.setTextColor(0, 0, 0);
       doc.text(item.produto.familia || "-", marginX, y);
-      doc.text(item.qtd.toFixed(2).replace(".", ","), colQtd, y, { align: "center" });
+      doc.text(num(item.qtd).toFixed(2).replace(".", ","), colQtd, y, { align: "center" });
       doc.text(item.produto.unidade || "-", colUnid, y, { align: "center" });
       doc.text(descLinhas, colDesc, y);
-      doc.text(item.preco.toFixed(2), colValor, y, { align: "right" });
-      doc.text((item.qtd * item.preco).toFixed(2), rightX, y, { align: "right" });
+      doc.text(num(item.preco).toFixed(2), colValor, y, { align: "right" });
+      doc.text((num(item.qtd) * num(item.preco)).toFixed(2), rightX, y, { align: "right" });
 
       let yLinha = y + descLinhas.length * 4;
       if (item.obs) {
@@ -483,7 +493,7 @@ export default function OrcamentoApp() {
     doc.text(subtotal.toFixed(2), rightX, y, { align: "right" });
     y += 5;
     doc.text("Desconto", colValor, y, { align: "right" });
-    doc.text((Number(desconto) || 0).toFixed(2), rightX, y, { align: "right" });
+    doc.text(num(desconto).toFixed(2), rightX, y, { align: "right" });
     y += 7;
     doc.setFont("helvetica", "bold");
     doc.setFontSize(13);
@@ -704,9 +714,8 @@ export default function OrcamentoApp() {
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <input
                       ref={(el) => (qtdRefs.current[i.produto.codigo] = el)}
-                      type="number"
-                      inputMode="numeric"
-                      min={0}
+                      type="text"
+                      inputMode="decimal"
                       value={i.qtd}
                       onChange={(e) => alterar(i.produto.codigo, "qtd", e.target.value)}
                       style={{ width: 56, padding: "9px 4px", fontSize: 16, textAlign: "center", border: `2px solid ${LARANJA}`, borderRadius: 8, fontWeight: 700 }}
@@ -721,10 +730,8 @@ export default function OrcamentoApp() {
                     <span style={{ fontSize: 12, color: "#666" }}>
                       Venda R${" "}
                       <input
-                        type="number"
+                        type="text"
                         inputMode="decimal"
-                        step="0.01"
-                        min={0}
                         value={i.preco}
                         onChange={(e) => alterar(i.produto.codigo, "preco", e.target.value)}
                         style={{ width: 80, padding: "4px 6px", fontSize: 13, border: "1.5px solid #ddd", borderRadius: 6, fontWeight: 600 }}
@@ -735,7 +742,7 @@ export default function OrcamentoApp() {
                       Custo {fmt(i.produto.custo)}
                     </span>
                     <span style={{ marginLeft: "auto", fontWeight: 700, color: LARANJA_ESCURO, fontSize: 15, whiteSpace: "nowrap" }}>
-                      Total {fmt(i.qtd * i.preco)}
+                      Total {fmt(num(i.qtd) * num(i.preco))}
                     </span>
                   </div>
                   {/* Observação do item (ex: lote, cor personalizada) */}
@@ -763,12 +770,10 @@ export default function OrcamentoApp() {
           <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 8, justifyContent: "flex-end" }}>
             <span style={{ fontSize: 13, color: "#666" }}>Desconto R$</span>
             <input
-              type="number"
+              type="text"
               inputMode="decimal"
-              step="0.01"
-              min={0}
               value={desconto}
-              onChange={(e) => setDesconto(Math.max(0, Number(e.target.value) || 0))}
+              onChange={(e) => setDesconto(e.target.value.replace(/[^\d.,]/g, ""))}
               style={{ width: 90, padding: "6px 8px", fontSize: 14, border: "1.5px solid #ddd", borderRadius: 6, fontWeight: 600, textAlign: "right" }}
             />
           </div>
@@ -780,7 +785,7 @@ export default function OrcamentoApp() {
             <div style={{ fontSize: 11, color: "#888" }}>Total do orçamento</div>
             <div style={{ fontSize: 20, fontWeight: 800, color: LARANJA_ESCURO }}>{fmt(total)}</div>
             <div style={{ fontSize: 12, color: "#999" }}>
-              {desconto > 0 && <>Subtotal {fmt(subtotal)} · Desconto {fmt(desconto)} · </>}
+              {num(desconto) > 0 && <>Subtotal {fmt(subtotal)} · Desconto {fmt(desconto)} · </>}
               Custo total {fmt(custoTotal)}
             </div>
           </div>
